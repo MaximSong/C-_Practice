@@ -1,148 +1,109 @@
 #include <iostream>
-#include <thread>
-#include <condition_variable>
-#include <mutex>
-#include <chrono>
+#include <vector>
 #include <queue>
-
-std::mutex mutxIdle;
-
-template <typename T>
-class TaskQueue
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
+#include <future>
+using namespace std;
+class ThreadPool
 {
 public:
-    void submitTask(T task)
+    ThreadPool(size_t threadCount , size_t maxQueSize)
+    :stop(false), maxQueSize_(maxQueSize)
     {
-        std::unique_lock<std::mutex> lock(mtx);
-        while (taskQue.size() >= maxSize)
+        for(int i = 0 ; i < threadCount; i ++)
         {
-            notFull.wait(lock);
+            workers.emplace_back([this](){
+                while(true)
+                {
+                    function<void()>task;
+                    {
+                        unique_lock<mutex> lock(mtx);
+                        notEmpty.wait(lock , [this](){
+                            return stop || !tasks.empty();
+                        });
+                    
+                    if(stop && tasks.empty())
+                    {
+                        return;
+                    }
+                    task = tasks.front();
+                    tasks.pop();
+                    notFull.notify_one();
+                    }
+                    task();
+                }
+                
+            });
         }
-        std::cout << "Produced Task: " << task << " | Queue size: " << taskQue.size() << "\n";
-        taskQue.push(task);
-        notEmpty.notify_all();
     }
-
-    void consumeTask()
+template<typename F , typename ...Args>
+auto submitTask(F && func , Args&&... args) -> future<decltype(func(args...))>
+{
+    using returnType = decltype(func(args...));
+    auto task = make_shared<packaged_task<returnType()>>(bind(forward<F>(func) , forward<Args>(args)...));
+    future<returnType> future = task -> get_future();
     {
-        std::unique_lock<std::mutex> lock(mtx);
-        while (taskQue.size() == 0)
+        unique_lock<mutex>lock(mtx);
+        notFull.wait(lock , [this](){
+            return stop || tasks.size() < maxQueSize_;
+        });
+        if(stop) throw runtime_error("Threadpool has stopped!");
+        tasks.emplace([task](){
+            (*task)();
+        });
+        notEmpty.notify_one();
+        
+    }
+    return future;
+}
+~ThreadPool()
+{
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        stop = true;
+    }
+    notEmpty.notify_all();
+    notFull.notify_all();
+
+    for (std::thread &worker : workers)
+    {
+        if (worker.joinable())
         {
-            notEmpty.wait(lock);
+            worker.join();
         }
-        T tsk = taskQue.front();
-        std::cout << "Consumed Task: " << tsk << " | Queue size: " << taskQue.size() << "\n";
-        taskQue.pop();
-        notFull.notify_all();
     }
-
-    int queueSize()
-    {
-        std::unique_lock<std::mutex> lock(mtx);
-        return taskQue.size();
-    }
+}
 
 private:
-    const int maxSize = 100;
-    std::queue<T> taskQue;
-    std::mutex mtx;
-    std::condition_variable notEmpty;
-    std::condition_variable notFull;
+    vector<thread> workers;
+    queue<function<void()>>tasks;
+    mutex mtx;
+    condition_variable notEmpty;
+    condition_variable notFull;
+    size_t maxQueSize_;
+    bool stop;
 };
-
-void consumerThread(TaskQueue<int> &queue, bool &done, int &idleThread)
-{
-    while (!done)
-    {
-        {
-            std::unique_lock<std::mutex> lock(mutxIdle);
-            idleThread--;
-        }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        queue.consumeTask();
-        {
-            std::unique_lock<std::mutex> lock(mutxIdle);
-            idleThread++;
-        }
-    }
-}
-
-void producerThread(TaskQueue<int> &queue, bool &done, int &taskCounter)
-{
-    while (!done)
-    {
-        std::this_thread::sleep_for(std::chrono::seconds(10));
-        queue.submitTask(taskCounter);
-        taskCounter++;
-    }
-}
-
-void managerThread(std::vector<std::thread> &consumerThreads, TaskQueue<int> &task, bool &done, int &idleThread)
-{
-    while (!done)
-    {
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-        int taskSize = task.queueSize();
-        if (taskSize > idleThread)
-        {
-            std::cout << "Adding more threads" << std::endl;
-            consumerThreads.push_back(std::thread(consumerThread, std::ref(task), std::ref(done), std::ref(idleThread)));
-        }
-        else if (taskSize < idleThread && idleThread > 1)
-        {
-            std::cout << "Removing idle thread" << std::endl;
-            idleThread--;
-            consumerThreads.back().join();
-            consumerThreads.pop_back();
-        }
-    }
-}
 
 int main()
 {
-    TaskQueue<int> queue;
-    int taskCounter = 0;
-    bool done = false;     // 结束标志
-    int idleConsumers = 0; // 空闲消费者计数
+    ThreadPool pool(4, 5);
 
-    // 初始化生产者和消费者线程
-    std::vector<std::thread> producers;
-    std::vector<std::thread> consumers;
+    // 提交带参数任务
+    auto future1 = pool.submitTask([](int a, int b)
+                                   {
+        std::cout << "Task 1: " << a + b << " (Thread " << std::this_thread::get_id() << ")" << std::endl;
+        return a + b; }, 2, 3);
 
-    // 创建初始的1个生产者和1个消费者
-    producers.push_back(std::thread(producerThread, std::ref(queue), std::ref(done), std::ref(taskCounter)));
-    consumers.push_back(std::thread(consumerThread, std::ref(queue), std::ref(done), std::ref(idleConsumers)));
-    idleConsumers = 1; // 初始时有1个空闲消费者
+    auto future2 = pool.submitTask([](std::string msg)
+                                   {
+        std::cout << "Task 2: " << msg << " (Thread " << std::this_thread::get_id() << ")" << std::endl;
+        return msg; }, "Hello, ThreadPool!");
 
-    // 管理线程的动态平衡
-    std::thread manager(managerThread, std::ref(consumers), std::ref(queue), std::ref(done), std::ref(idleConsumers));
+    std::cout << "Result 1: " << future1.get() << std::endl;
+    std::cout << "Result 2: " << future2.get() << std::endl;
 
-    // 模拟运行一段时间（例如 60 秒），然后结束程序
-    std::this_thread::sleep_for(std::chrono::seconds(60));
-    done = true; // 结束标志，通知所有线程退出
-
-    // 等待所有生产者和消费者线程完成
-    for (auto &p : producers)
-    {
-        if (p.joinable())
-        {
-            p.join();
-        }
-    }
-
-    for (auto &c : consumers)
-    {
-        if (c.joinable())
-        {
-            c.join();
-        }
-    }
-
-    if (manager.joinable())
-    {
-        manager.join();
-    }
-
-    std::cout << "All threads finished.\n";
     return 0;
 }
