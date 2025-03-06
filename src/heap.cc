@@ -1,6 +1,32 @@
 #include <iostream>
 #include <vector>
+#include <queue>
 using namespace std;
+vector<int> topKLargest(vector<int> &nums, int K)
+{
+    priority_queue<int, vector<int>, greater<int>> minHeap; // 小根堆
+
+    for (int num : nums)
+    {
+        if (minHeap.size() < K)
+        {
+            minHeap.push(num);
+        }
+        else if (num > minHeap.top())
+        {
+            minHeap.pop();
+            minHeap.push(num);
+        }
+    }
+
+    vector<int> result;
+    while (!minHeap.empty())
+    {
+        result.push_back(minHeap.top());
+        minHeap.pop();
+    }
+    return result;
+}
 void heapify(vector<int>&vec , int n , int i)
 {
     int largestIndex = i;
